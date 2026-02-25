@@ -124,8 +124,12 @@ func TestReserveAndRelease(t *testing.T) {
 	}
 
 	// Release one (simulating non-2xx response)
-	if err := s.ReleaseRequest(run.ID); err != nil {
+	releasedCount, err := s.ReleaseRequest(run.ID)
+	if err != nil {
 		t.Fatalf("ReleaseRequest: %v", err)
+	}
+	if releasedCount != 1 {
+		t.Errorf("expected released count 1, got %d", releasedCount)
 	}
 
 	// Verify count is back to 1
@@ -172,7 +176,13 @@ func TestReserveExhaustedThenRelease(t *testing.T) {
 	}
 
 	// Release one (simulating non-2xx that exhausted the budget)
-	s.ReleaseRequest(run.ID)
+	releasedCount, err := s.ReleaseRequest(run.ID)
+	if err != nil {
+		t.Fatalf("ReleaseRequest: %v", err)
+	}
+	if releasedCount != 2 {
+		t.Errorf("expected released count 2, got %d", releasedCount)
+	}
 
 	// Status should revert to 'active'
 	got, _ := s.GetRun(run.ID)

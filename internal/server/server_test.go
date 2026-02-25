@@ -42,8 +42,9 @@ func setupTest(t *testing.T) *testEnv {
 
 	env.cfg = &config.Config{
 		Admin: config.AdminConfig{
-			Secret: "test-admin-secret",
-			Port:   9999,
+			Secret:   "test-admin-secret",
+			Port:     9999,
+			ProxyURL: "http://localhost:9999",
 		},
 		Credentials: map[string]config.CredentialConfig{
 			"test-cred": {
@@ -402,6 +403,13 @@ func TestCloseRunFlushMissingPath(t *testing.T) {
 		t.Errorf("expected 400 for flush without path, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+
+	// N1: Run should still be active after failed flush validation
+	getResp := adminReq(env, "GET", "/admin/runs/"+runID, "")
+	result := readJSON(getResp)
+	if result["status"].(string) != "active" {
+		t.Errorf("expected run still active after bad flush request, got %q", result["status"])
+	}
 }
 
 func TestCloseRunNotFound(t *testing.T) {
@@ -1267,5 +1275,50 @@ func TestPathAllowed(t *testing.T) {
 				t.Errorf("pathAllowed(%q, %v) = %v, want %v", tt.path, tt.allowed, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestProxyContentLengthSet(t *testing.T) {
+	env := setupTest(t)
+
+	responseBody := `{"data":"hello world"}`
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(responseBody))
+	}
+
+	_, token := createRun(t, env, "test-svc")
+
+	resp := proxyReq(env, "GET", "/test", token)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	cl := resp.Header.Get("Content-Length")
+	if cl != fmt.Sprintf("%d", len(responseBody)) {
+		t.Errorf("expected Content-Length=%d, got %q", len(responseBody), cl)
+	}
+	if len(body) != len(responseBody) {
+		t.Errorf("expected body length %d, got %d", len(responseBody), len(body))
+	}
+}
+
+func TestCreateRunProxyURLConfigurable(t *testing.T) {
+	env := setupTest(t)
+
+	// Default proxy_url should be based on port
+	resp := adminReq(env, "POST", "/admin/runs", `{"service":"test-svc"}`)
+	result := readJSON(resp)
+	proxyURL := result["proxy_url"].(string)
+	if proxyURL != fmt.Sprintf("http://localhost:%d", env.cfg.Admin.Port) {
+		t.Errorf("expected default proxy_url with port, got %q", proxyURL)
+	}
+
+	// Set a custom proxy_url
+	env.cfg.Admin.ProxyURL = "https://proxy.example.com"
+	resp2 := adminReq(env, "POST", "/admin/runs", `{"service":"test-svc"}`)
+	result2 := readJSON(resp2)
+	proxyURL2 := result2["proxy_url"].(string)
+	if proxyURL2 != "https://proxy.example.com" {
+		t.Errorf("expected custom proxy_url, got %q", proxyURL2)
 	}
 }

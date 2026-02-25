@@ -33,7 +33,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusCreated, map[string]interface{}{
 		"run_id":    run.ID,
 		"token":     run.Token,
-		"proxy_url": fmt.Sprintf("http://localhost:%d", s.cfg.Admin.Port),
+		"proxy_url": s.cfg.Admin.ProxyURL,
 	})
 }
 
@@ -145,15 +145,19 @@ func (s *Server) closeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate flush parameters before changing any state
+	if req.Mode == "flush" && req.Path == "" {
+		jsonError(w, http.StatusBadRequest, "bad_request", "Flush mode requires a 'path' field.")
+		return
+	}
+
 	// Set status to closed before purging to block in-flight proxy requests
-	s.store.UpdateRunStatus(id, "closed")
+	if err := s.store.UpdateRunStatus(id, "closed"); err != nil {
+		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to close run.")
+		return
+	}
 
 	if req.Mode == "flush" {
-		if req.Path == "" {
-			jsonError(w, http.StatusBadRequest, "bad_request", "Flush mode requires a 'path' field.")
-			return
-		}
-
 		svc := s.cfg.Services[run.Service]
 
 		logs, _ := s.store.GetRequestLogs(id)

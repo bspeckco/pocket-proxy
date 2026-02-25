@@ -98,10 +98,10 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		logPath = targetPath + "?" + r.URL.RawQuery
 	}
 
-	// Read request body for dedup and forwarding
+	// Read request body for dedup and forwarding (bounded to prevent memory exhaustion)
 	var reqBody []byte
 	if r.Body != nil {
-		reqBody, err = io.ReadAll(r.Body)
+		reqBody, err = io.ReadAll(io.LimitReader(r.Body, maxProxyReadSize))
 		if err != nil {
 			jsonError(w, http.StatusBadRequest, "bad_request", "Failed to read request body.")
 			return
@@ -178,7 +178,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bodyReader)
 	if err != nil {
-		if releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
+		if _, releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
 			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
 		}
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to create upstream request.")
@@ -201,7 +201,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := proxyClient.Do(upstreamReq)
 	if err != nil {
-		if releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
+		if _, releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
 			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
 		}
 		jsonError(w, http.StatusBadGateway, "upstream_error", "Failed to reach upstream service.")
@@ -212,7 +212,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	// 9. Read response body (bounded)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProxyReadSize))
 	if err != nil {
-		if releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
+		if _, releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
 			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
 		}
 		jsonError(w, http.StatusBadGateway, "upstream_error", "Failed to read upstream response.")
@@ -224,11 +224,13 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	counted := is2xx
 
 	if !is2xx {
-		// Non-2xx: release the reservation
-		if releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
+		// Non-2xx: release the reservation and use the actual DB count
+		releasedCount, releaseErr := s.store.ReleaseRequest(run.ID)
+		if releaseErr != nil {
 			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
+		} else {
+			newCount = releasedCount
 		}
-		newCount = newCount - 1
 	}
 
 	// 11. Log the request
@@ -261,6 +263,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(key, v)
 		}
 	}
+
+	// Set accurate Content-Length from the buffered body
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 
 	setBudgetHeaders(w, newCount, svc.MaxRequests)
 	w.WriteHeader(resp.StatusCode)

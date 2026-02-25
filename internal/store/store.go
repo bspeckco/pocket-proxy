@@ -251,7 +251,7 @@ func (s *Store) ReserveRequest(runID string, maxRequests int) (newCount int, err
 
 // ReleaseRequest decrements requests_used for a run. Called when the upstream
 // response is non-2xx and shouldn't count against budget.
-func (s *Store) ReleaseRequest(runID string) error {
+func (s *Store) ReleaseRequest(runID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -262,7 +262,13 @@ func (s *Store) ReleaseRequest(runID string) error {
 		`UPDATE runs SET requests_used = requests_used - 1 WHERE id = ? AND requests_used > 0`,
 		runID,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+
+	var count int
+	err = s.db.QueryRow(`SELECT requests_used FROM runs WHERE id = ?`, runID).Scan(&count)
+	return count, err
 }
 
 func (s *Store) UpdateRunStatus(runID, status string) error {

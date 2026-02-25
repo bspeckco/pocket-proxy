@@ -19,6 +19,7 @@ type AdminConfig struct {
 	Port        int    `yaml:"port"`
 	IDSize      int    `yaml:"id_size"`
 	MaxRespSize int    `yaml:"max_response_size"`
+	ProxyURL    string `yaml:"proxy_url"`
 }
 
 type CredentialConfig struct {
@@ -68,6 +69,9 @@ func validate(cfg *Config) (*Config, error) {
 	}
 	if cfg.Admin.MaxRespSize == 0 {
 		cfg.Admin.MaxRespSize = 1 << 20 // 1MB
+	}
+	if cfg.Admin.ProxyURL == "" {
+		cfg.Admin.ProxyURL = fmt.Sprintf("http://localhost:%d", cfg.Admin.Port)
 	}
 
 	if len(cfg.Services) == 0 {
