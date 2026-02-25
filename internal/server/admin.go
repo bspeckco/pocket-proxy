@@ -26,9 +26,12 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	expiresAt := time.Now().UTC().Add(time.Duration(svc.ExpiresInSeconds) * time.Second)
 	run, err := s.store.CreateRun(req.Service, expiresAt)
 	if err != nil {
+		s.log.Error("failed to create run for service %s: %v", req.Service, err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to create run.")
 		return
 	}
+
+	s.log.Info("run created: id=%s service=%s max_requests=%d expires_in=%ds", run.ID, req.Service, svc.MaxRequests, svc.ExpiresInSeconds)
 
 	jsonResponse(w, http.StatusCreated, map[string]interface{}{
 		"run_id":    run.ID,
@@ -42,6 +45,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 
 	run, err := s.store.GetRun(id)
 	if err != nil {
+		s.log.Error("failed to get run %s: %v", id, err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to get run.")
 		return
 	}
@@ -54,6 +58,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 
 	logs, err := s.store.GetRequestLogs(run.ID)
 	if err != nil {
+		s.log.Error("failed to get request logs for run %s: %v", run.ID, err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to get request logs.")
 		return
 	}
@@ -89,6 +94,7 @@ func (s *Server) getResponses(w http.ResponseWriter, r *http.Request) {
 
 	run, err := s.store.GetRun(id)
 	if err != nil {
+		s.log.Error("failed to get run %s: %v", id, err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to get run.")
 		return
 	}
@@ -99,6 +105,7 @@ func (s *Server) getResponses(w http.ResponseWriter, r *http.Request) {
 
 	responses, err := s.store.GetResponses(run.ID)
 	if err != nil {
+		s.log.Error("failed to get responses for run %s: %v", run.ID, err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to get responses.")
 		return
 	}
@@ -137,6 +144,7 @@ func (s *Server) closeRun(w http.ResponseWriter, r *http.Request) {
 
 	run, err := s.store.GetRun(id)
 	if err != nil {
+		s.log.Error("failed to get run %s: %v", id, err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to get run.")
 		return
 	}
@@ -153,6 +161,7 @@ func (s *Server) closeRun(w http.ResponseWriter, r *http.Request) {
 
 	// Set status to closed before purging to block in-flight proxy requests
 	if err := s.store.UpdateRunStatus(id, "closed"); err != nil {
+		s.log.Error("failed to close run %s: %v", id, err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to close run.")
 		return
 	}
@@ -200,17 +209,22 @@ func (s *Server) closeRun(w http.ResponseWriter, r *http.Request) {
 
 		fileData, err := json.MarshalIndent(data, "", "  ")
 		if err != nil {
+			s.log.Error("failed to marshal flush data for run %s: %v", id, err)
 			jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to marshal flush data.")
 			return
 		}
 		if err := os.WriteFile(req.Path, fileData, 0644); err != nil {
+			s.log.Error("failed to write flush file for run %s: %v", id, err)
 			jsonError(w, http.StatusInternalServerError, "internal_error", fmt.Sprintf("Failed to write flush data: %v", err))
 			return
 		}
+		s.log.Info("run %s flushed to %s", id, req.Path)
 	}
 
 	// Purge all run data
 	s.store.DeleteRunData(id)
+
+	s.log.Info("run closed: id=%s mode=%s", id, req.Mode)
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"status": "closed",
@@ -222,6 +236,7 @@ func (s *Server) revokeRun(w http.ResponseWriter, r *http.Request) {
 
 	run, err := s.store.GetRun(id)
 	if err != nil {
+		s.log.Error("failed to get run %s: %v", id, err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to get run.")
 		return
 	}
@@ -231,9 +246,12 @@ func (s *Server) revokeRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.store.UpdateRunStatus(id, "revoked"); err != nil {
+		s.log.Error("failed to revoke run %s: %v", id, err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to revoke run.")
 		return
 	}
+
+	s.log.Info("run revoked: id=%s", id)
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"status": "revoked",

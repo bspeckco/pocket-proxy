@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -371,6 +372,66 @@ func TestInvalidYAML(t *testing.T) {
 	_, err := Parse([]byte("{{not yaml"))
 	if err == nil {
 		t.Fatal("expected error for invalid YAML")
+	}
+}
+
+func TestLogLevelDefault(t *testing.T) {
+	cfg, err := Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Admin.LogLevel != "info" {
+		t.Errorf("expected default log_level 'info', got %q", cfg.Admin.LogLevel)
+	}
+}
+
+func TestLogLevelValid(t *testing.T) {
+	for _, level := range []string{"debug", "info", "warn", "error", "DEBUG", "Info", "WARN"} {
+		yaml := fmt.Sprintf(`
+admin:
+  secret: "s"
+  port: 9120
+  log_level: "%s"
+credentials:
+  c:
+    header: "H"
+    value: "V"
+services:
+  s:
+    base_url: "http://x"
+    credential: "c"
+    allowed_paths: ["/"]
+    max_requests: 1
+    expires_in_seconds: 60
+`, level)
+		_, err := Parse([]byte(yaml))
+		if err != nil {
+			t.Errorf("expected log_level %q to be valid, got error: %v", level, err)
+		}
+	}
+}
+
+func TestLogLevelInvalid(t *testing.T) {
+	yaml := `
+admin:
+  secret: "s"
+  port: 9120
+  log_level: "trace"
+credentials:
+  c:
+    header: "H"
+    value: "V"
+services:
+  s:
+    base_url: "http://x"
+    credential: "c"
+    allowed_paths: ["/"]
+    max_requests: 1
+    expires_in_seconds: 60
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for invalid log_level")
 	}
 }
 

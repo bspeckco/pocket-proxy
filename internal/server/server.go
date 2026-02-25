@@ -7,19 +7,22 @@ import (
 	"strings"
 
 	"pocket-proxy/internal/config"
+	"pocket-proxy/internal/logger"
 	"pocket-proxy/internal/store"
 )
 
 type Server struct {
 	cfg   *config.Config
 	store *store.Store
+	log   *logger.Logger
 	mux   *http.ServeMux
 }
 
-func New(cfg *config.Config, st *store.Store) *Server {
+func New(cfg *config.Config, st *store.Store, log *logger.Logger) *Server {
 	s := &Server{
 		cfg:   cfg,
 		store: st,
+		log:   log,
 		mux:   http.NewServeMux(),
 	}
 	s.routes()
@@ -46,11 +49,13 @@ func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
+			s.log.Debug("admin auth failed: missing Bearer prefix")
 			jsonError(w, http.StatusUnauthorized, "unauthorized", "Invalid or missing admin secret.")
 			return
 		}
 		token := strings.TrimPrefix(auth, "Bearer ")
 		if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Admin.Secret)) != 1 {
+			s.log.Debug("admin auth failed: invalid secret")
 			jsonError(w, http.StatusUnauthorized, "unauthorized", "Invalid or missing admin secret.")
 			return
 		}

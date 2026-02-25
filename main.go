@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -10,6 +9,7 @@ import (
 	"syscall"
 
 	"pocket-proxy/internal/config"
+	"pocket-proxy/internal/logger"
 	"pocket-proxy/internal/server"
 	"pocket-proxy/internal/store"
 )
@@ -24,12 +24,25 @@ func main() {
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+		os.Exit(1)
 	}
+
+	// Initialize logger from config
+	level, _ := logger.ParseLevel(cfg.Admin.LogLevel) // already validated
+	log, err := logger.New(logger.Options{
+		Level:   level,
+		LogFile: cfg.Admin.LogFile,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer log.Close()
 
 	// Securely delete config file (secureDelete already falls back to os.Remove)
 	if err := secureDelete(configPath); err != nil {
-		log.Printf("warning: failed to delete config file: %v", err)
+		log.Warn("failed to delete config file: %v", err)
 	}
 
 	st, err := store.New(store.StoreOptions{
@@ -37,11 +50,11 @@ func main() {
 		MaxRespSize: cfg.Admin.MaxRespSize,
 	})
 	if err != nil {
-		log.Fatalf("failed to initialize store: %v", err)
+		log.Fatal("failed to initialize store: %v", err)
 	}
 	defer st.Close()
 
-	srv := server.New(cfg, st)
+	srv := server.New(cfg, st, log)
 
 	addr := fmt.Sprintf(":%d", cfg.Admin.Port)
 	httpServer := &http.Server{
@@ -54,13 +67,13 @@ func main() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
-		log.Println("shutting down...")
+		log.Info("shutting down...")
 		httpServer.Close()
 	}()
 
-	log.Printf("pocket-proxy listening on %s", addr)
+	log.Info("pocket-proxy listening on %s (log_level=%s)", addr, cfg.Admin.LogLevel)
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
-		log.Fatalf("server error: %v", err)
+		log.Fatal("server error: %v", err)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"pocket-proxy/internal/config"
+	"pocket-proxy/internal/logger"
 	"pocket-proxy/internal/store"
 )
 
@@ -89,7 +90,7 @@ func setupTest(t *testing.T) *testEnv {
 		t.Fatalf("failed to create store: %v", err)
 	}
 
-	env.server = New(env.cfg, env.store)
+	env.server = New(env.cfg, env.store, logger.Nop())
 	env.proxy = httptest.NewServer(env.server)
 
 	t.Cleanup(func() {

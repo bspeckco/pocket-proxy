@@ -4,9 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+var validLogLevels = map[string]bool{
+	"debug": true,
+	"info":  true,
+	"warn":  true,
+	"error": true,
+}
 
 type Config struct {
 	Admin       AdminConfig                `yaml:"admin"`
@@ -20,6 +28,8 @@ type AdminConfig struct {
 	IDSize      int    `yaml:"id_size"`
 	MaxRespSize int    `yaml:"max_response_size"`
 	ProxyURL    string `yaml:"proxy_url"`
+	LogLevel    string `yaml:"log_level"`
+	LogFile     string `yaml:"log_file"`
 }
 
 type CredentialConfig struct {
@@ -72,6 +82,14 @@ func validate(cfg *Config) (*Config, error) {
 	}
 	if cfg.Admin.ProxyURL == "" {
 		cfg.Admin.ProxyURL = fmt.Sprintf("http://localhost:%d", cfg.Admin.Port)
+	}
+	if cfg.Admin.LogLevel == "" {
+		cfg.Admin.LogLevel = "info"
+	} else {
+		cfg.Admin.LogLevel = strings.ToLower(cfg.Admin.LogLevel)
+		if !validLogLevels[cfg.Admin.LogLevel] {
+			return nil, fmt.Errorf("admin.log_level must be one of debug, info, warn, error; got %q", cfg.Admin.LogLevel)
+		}
 	}
 
 	if len(cfg.Services) == 0 {

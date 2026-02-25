@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -38,16 +37,19 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	// 1. Extract and validate run token
 	token := r.Header.Get("X-Run-Token")
 	if token == "" {
+		s.log.Debug("proxy request rejected: missing X-Run-Token")
 		jsonError(w, http.StatusUnauthorized, "unauthorized", "Missing or invalid run token.")
 		return
 	}
 
 	run, err := s.store.GetRunByToken(token)
 	if err != nil {
+		s.log.Error("failed to look up run by token: %v", err)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to look up run.")
 		return
 	}
 	if run == nil {
+		s.log.Debug("proxy request rejected: unknown token")
 		jsonError(w, http.StatusUnauthorized, "unauthorized", "Missing or invalid run token.")
 		return
 	}
@@ -55,12 +57,14 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	// 2. Look up service config
 	svc, ok := s.cfg.Services[run.Service]
 	if !ok {
+		s.log.Error("service %q not found in config for run %s", run.Service, run.ID)
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Service configuration not found.")
 		return
 	}
 
 	// 3. Check run status
 	if run.Status == "exhausted" {
+		s.log.Debug("proxy request rejected: run %s budget exhausted", run.ID)
 		w.Header().Set("Content-Type", "application/json")
 		setBudgetHeaders(w, run.RequestsUsed, svc.MaxRequests)
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -73,10 +77,12 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if run.Status != "active" {
+		s.log.Debug("proxy request rejected: run %s status is %s", run.ID, run.Status)
 		jsonError(w, http.StatusForbidden, "run_terminated", "This run has been revoked or has expired.")
 		return
 	}
 	if time.Now().UTC().After(run.ExpiresAt) {
+		s.log.Debug("proxy request rejected: run %s has expired", run.ID)
 		jsonError(w, http.StatusForbidden, "run_terminated", "This run has been revoked or has expired.")
 		return
 	}
@@ -88,6 +94,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !pathAllowed(targetPath, svc.AllowedPaths) {
+		s.log.Debug("proxy request rejected: path %q not allowed for run %s", targetPath, run.ID)
 		jsonError(w, http.StatusForbidden, "path_not_allowed", "This path is not permitted for the current run.")
 		return
 	}
@@ -103,6 +110,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		reqBody, err = io.ReadAll(io.LimitReader(r.Body, maxProxyReadSize))
 		if err != nil {
+			s.log.Warn("failed to read request body for run %s: %v", run.ID, err)
 			jsonError(w, http.StatusBadRequest, "bad_request", "Failed to read request body.")
 			return
 		}
@@ -114,6 +122,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	if svc.DedupEnabled && svc.StoreResponses {
 		entry, err := s.store.FindDedupEntry(run.ID, dedupKey)
 		if err == nil && entry != nil && entry.ResponseBody != nil {
+			s.log.Debug("dedup hit for run %s: %s %s", run.ID, r.Method, logPath)
 			setBudgetHeaders(w, run.RequestsUsed, svc.MaxRequests)
 			w.Header().Set("X-Dedup", "true")
 			ct := entry.ContentType
@@ -129,6 +138,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	// 7. Check budget - atomic reserve
 	if run.RequestsUsed >= svc.MaxRequests {
+		s.log.Debug("proxy request rejected: run %s budget check failed (%d/%d)", run.ID, run.RequestsUsed, svc.MaxRequests)
 		w.Header().Set("Content-Type", "application/json")
 		setBudgetHeaders(w, run.RequestsUsed, svc.MaxRequests)
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -145,6 +155,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch err {
 		case store.ErrBudgetExhausted:
+			s.log.Debug("proxy request rejected: run %s budget exhausted on reserve", run.ID)
 			w.Header().Set("Content-Type", "application/json")
 			setBudgetHeaders(w, svc.MaxRequests, svc.MaxRequests)
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -155,10 +166,13 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 				"max_requests":  svc.MaxRequests,
 			})
 		case store.ErrRunNotActive:
+			s.log.Debug("proxy request rejected: run %s not active on reserve", run.ID)
 			jsonError(w, http.StatusForbidden, "run_terminated", "This run has been revoked or has expired.")
 		case store.ErrRunExpired:
+			s.log.Debug("proxy request rejected: run %s expired on reserve", run.ID)
 			jsonError(w, http.StatusForbidden, "run_terminated", "This run has been revoked or has expired.")
 		default:
+			s.log.Error("failed to reserve request for run %s: %v", run.ID, err)
 			jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to process request.")
 		}
 		return
@@ -171,15 +185,20 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		targetURL += "?" + r.URL.RawQuery
 	}
 
+	s.log.Info("proxy %s %s -> %s (run=%s, budget=%d/%d)", r.Method, logPath, run.Service, run.ID, newCount, svc.MaxRequests)
+	s.log.Debug("upstream url: %s", targetURL)
+
 	var bodyReader io.Reader
 	if len(reqBody) > 0 {
 		bodyReader = bytes.NewReader(reqBody)
+		s.log.Debug("request body: %d bytes", len(reqBody))
 	}
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bodyReader)
 	if err != nil {
+		s.log.Error("failed to create upstream request for run %s: %v", run.ID, err)
 		if _, releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
-			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
+			s.log.Error("failed to release request for run %s: %v", run.ID, releaseErr)
 		}
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to create upstream request.")
 		return
@@ -201,8 +220,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := proxyClient.Do(upstreamReq)
 	if err != nil {
+		s.log.Warn("upstream error for run %s: %v", run.ID, err)
 		if _, releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
-			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
+			s.log.Error("failed to release request for run %s: %v", run.ID, releaseErr)
 		}
 		jsonError(w, http.StatusBadGateway, "upstream_error", "Failed to reach upstream service.")
 		return
@@ -212,12 +232,15 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	// 9. Read response body (bounded)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProxyReadSize))
 	if err != nil {
+		s.log.Warn("failed to read upstream response for run %s: %v", run.ID, err)
 		if _, releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
-			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
+			s.log.Error("failed to release request for run %s: %v", run.ID, releaseErr)
 		}
 		jsonError(w, http.StatusBadGateway, "upstream_error", "Failed to read upstream response.")
 		return
 	}
+
+	s.log.Debug("upstream response: %d, %d bytes", resp.StatusCode, len(body))
 
 	// 10. Determine if this counts against budget
 	is2xx := resp.StatusCode >= 200 && resp.StatusCode < 300
@@ -225,9 +248,10 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	if !is2xx {
 		// Non-2xx: release the reservation and use the actual DB count
+		s.log.Debug("non-2xx response (%d), releasing budget reservation for run %s", resp.StatusCode, run.ID)
 		releasedCount, releaseErr := s.store.ReleaseRequest(run.ID)
 		if releaseErr != nil {
-			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
+			s.log.Error("failed to release request for run %s: %v", run.ID, releaseErr)
 		} else {
 			newCount = releasedCount
 		}
@@ -251,7 +275,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if logErr := s.store.LogRequest(logEntry); logErr != nil {
-		log.Printf("error logging request for run %s: %v", run.ID, logErr)
+		s.log.Error("failed to log request for run %s: %v", run.ID, logErr)
 	}
 
 	// 12. Forward upstream response to agent
