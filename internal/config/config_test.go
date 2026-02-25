@@ -386,7 +386,7 @@ func TestLogLevelDefault(t *testing.T) {
 }
 
 func TestLogLevelValid(t *testing.T) {
-	for _, level := range []string{"debug", "info", "warn", "error", "DEBUG", "Info", "WARN"} {
+	for _, level := range []string{"trace", "debug", "info", "warn", "error", "TRACE", "DEBUG", "Info", "WARN"} {
 		yaml := fmt.Sprintf(`
 admin:
   secret: "s"
@@ -416,7 +416,7 @@ func TestLogLevelInvalid(t *testing.T) {
 admin:
   secret: "s"
   port: 9120
-  log_level: "trace"
+  log_level: "verbose"
 credentials:
   c:
     header: "H"

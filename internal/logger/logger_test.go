@@ -14,6 +14,8 @@ func TestParseLevel(t *testing.T) {
 		want  Level
 		err   bool
 	}{
+		{"trace", LevelTrace, false},
+		{"TRACE", LevelTrace, false},
 		{"debug", LevelDebug, false},
 		{"DEBUG", LevelDebug, false},
 		{"info", LevelInfo, false},
@@ -43,12 +45,16 @@ func TestLevelFiltering(t *testing.T) {
 	var buf bytes.Buffer
 	l := &Logger{level: LevelWarn, out: &buf}
 
+	l.Trace("trace msg")
 	l.Debug("debug msg")
 	l.Info("info msg")
 	l.Warn("warn msg")
 	l.Error("error msg")
 
 	output := buf.String()
+	if strings.Contains(output, "trace msg") {
+		t.Error("trace message should be filtered at warn level")
+	}
 	if strings.Contains(output, "debug msg") {
 		t.Error("debug message should be filtered at warn level")
 	}
@@ -60,6 +66,22 @@ func TestLevelFiltering(t *testing.T) {
 	}
 	if !strings.Contains(output, "error msg") {
 		t.Error("error message should be present at warn level")
+	}
+}
+
+func TestTraceLevelShowsAll(t *testing.T) {
+	var buf bytes.Buffer
+	l := &Logger{level: LevelTrace, out: &buf}
+
+	l.Trace("trace msg")
+	l.Debug("debug msg")
+
+	output := buf.String()
+	if !strings.Contains(output, "TRC") {
+		t.Error("trace message should be present at trace level")
+	}
+	if !strings.Contains(output, "DBG") {
+		t.Error("debug message should be present at trace level")
 	}
 }
 
@@ -105,6 +127,7 @@ func TestLogToFile(t *testing.T) {
 func TestNopLogger(t *testing.T) {
 	l := Nop()
 	// Should not panic
+	l.Trace("ignored")
 	l.Debug("ignored")
 	l.Info("ignored")
 	l.Warn("ignored")
@@ -112,6 +135,9 @@ func TestNopLogger(t *testing.T) {
 }
 
 func TestLevelString(t *testing.T) {
+	if LevelTrace.String() != "TRC" {
+		t.Errorf("expected TRC, got %s", LevelTrace.String())
+	}
 	if LevelDebug.String() != "DBG" {
 		t.Errorf("expected DBG, got %s", LevelDebug.String())
 	}

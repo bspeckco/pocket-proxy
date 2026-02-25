@@ -12,13 +12,14 @@ import (
 type Level int
 
 const (
-	LevelDebug Level = iota
+	LevelTrace Level = iota
+	LevelDebug
 	LevelInfo
 	LevelWarn
 	LevelError
 )
 
-var levelNames = [...]string{"DBG", "INF", "WRN", "ERR"}
+var levelNames = [...]string{"TRC", "DBG", "INF", "WRN", "ERR"}
 
 func (l Level) String() string {
 	if int(l) < len(levelNames) {
@@ -28,9 +29,11 @@ func (l Level) String() string {
 }
 
 // ParseLevel parses a level string (case-insensitive).
-// Valid values: "debug", "info", "warn", "error".
+// Valid values: "trace", "debug", "info", "warn", "error".
 func ParseLevel(s string) (Level, error) {
 	switch strings.ToLower(s) {
+	case "trace":
+		return LevelTrace, nil
 	case "debug":
 		return LevelDebug, nil
 	case "info":
@@ -40,7 +43,7 @@ func ParseLevel(s string) (Level, error) {
 	case "error":
 		return LevelError, nil
 	default:
-		return LevelInfo, fmt.Errorf("unknown log level %q (valid: debug, info, warn, error)", s)
+		return LevelInfo, fmt.Errorf("unknown log level %q (valid: trace, debug, info, warn, error)", s)
 	}
 }
 
@@ -98,6 +101,7 @@ func (l *Logger) log(level Level, msg string, args ...any) {
 	l.mu.Unlock()
 }
 
+func (l *Logger) Trace(msg string, args ...any) { l.log(LevelTrace, msg, args...) }
 func (l *Logger) Debug(msg string, args ...any) { l.log(LevelDebug, msg, args...) }
 func (l *Logger) Info(msg string, args ...any)  { l.log(LevelInfo, msg, args...) }
 func (l *Logger) Warn(msg string, args ...any)  { l.log(LevelWarn, msg, args...) }

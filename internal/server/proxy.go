@@ -188,6 +188,13 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("proxy %s %s -> %s (run=%s, budget=%d/%d)", r.Method, logPath, run.Service, run.ID, newCount, svc.MaxRequests)
 	s.log.Debug("upstream url: %s", targetURL)
 
+	// Log inbound request headers
+	for key, values := range r.Header {
+		for _, v := range values {
+			s.log.Trace("inbound header: %s: %s", key, v)
+		}
+	}
+
 	var bodyReader io.Reader
 	if len(reqBody) > 0 {
 		bodyReader = bytes.NewReader(reqBody)
@@ -207,6 +214,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	// Forward request headers (except hop-by-hop and token)
 	for key, values := range r.Header {
 		if hopByHopHeaders[key] || key == "X-Run-Token" {
+			s.log.Trace("skipping inbound header: %s", key)
 			continue
 		}
 		for _, v := range values {
@@ -217,6 +225,13 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	// Inject credential
 	cred := s.cfg.Credentials[svc.Credential]
 	upstreamReq.Header.Set(cred.Header, cred.Value)
+
+	// Log all outbound headers (includes injected credential)
+	for key, values := range upstreamReq.Header {
+		for _, v := range values {
+			s.log.Trace("upstream header: %s: %s", key, v)
+		}
+	}
 
 	resp, err := proxyClient.Do(upstreamReq)
 	if err != nil {
@@ -241,6 +256,11 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.log.Debug("upstream response: %d, %d bytes", resp.StatusCode, len(body))
+	for key, values := range resp.Header {
+		for _, v := range values {
+			s.log.Trace("response header: %s: %s", key, v)
+		}
+	}
 
 	// 10. Determine if this counts against budget
 	is2xx := resp.StatusCode >= 200 && resp.StatusCode < 300

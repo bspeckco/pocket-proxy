@@ -10,6 +10,7 @@ import (
 )
 
 var validLogLevels = map[string]bool{
+	"trace": true,
 	"debug": true,
 	"info":  true,
 	"warn":  true,
@@ -88,7 +89,7 @@ func validate(cfg *Config) (*Config, error) {
 	} else {
 		cfg.Admin.LogLevel = strings.ToLower(cfg.Admin.LogLevel)
 		if !validLogLevels[cfg.Admin.LogLevel] {
-			return nil, fmt.Errorf("admin.log_level must be one of debug, info, warn, error; got %q", cfg.Admin.LogLevel)
+			return nil, fmt.Errorf("admin.log_level must be one of trace, debug, info, warn, error; got %q", cfg.Admin.LogLevel)
 		}
 	}
 
