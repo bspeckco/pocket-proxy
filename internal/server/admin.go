@@ -145,11 +145,16 @@ func (s *Server) closeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Set status to closed before purging to block in-flight proxy requests
+	s.store.UpdateRunStatus(id, "closed")
+
 	if req.Mode == "flush" {
 		if req.Path == "" {
 			jsonError(w, http.StatusBadRequest, "bad_request", "Flush mode requires a 'path' field.")
 			return
 		}
+
+		svc := s.cfg.Services[run.Service]
 
 		logs, _ := s.store.GetRequestLogs(id)
 		responses, _ := s.store.GetResponses(id)
@@ -180,11 +185,13 @@ func (s *Server) closeRun(w http.ResponseWriter, r *http.Request) {
 		}
 
 		data := map[string]interface{}{
-			"run_id":    run.ID,
-			"service":   run.Service,
-			"status":    run.Status,
-			"requests":  requestData,
-			"responses": responseData,
+			"run_id":        run.ID,
+			"service":       run.Service,
+			"status":        run.Status,
+			"requests_used": run.RequestsUsed,
+			"max_requests":  svc.MaxRequests,
+			"requests":      requestData,
+			"responses":     responseData,
 		}
 
 		fileData, err := json.MarshalIndent(data, "", "  ")

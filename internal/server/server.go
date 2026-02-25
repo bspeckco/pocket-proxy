@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -49,7 +50,7 @@ func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		token := strings.TrimPrefix(auth, "Bearer ")
-		if token != s.cfg.Admin.Secret {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Admin.Secret)) != 1 {
 			jsonError(w, http.StatusUnauthorized, "unauthorized", "Invalid or missing admin secret.")
 			return
 		}
@@ -72,6 +73,10 @@ func jsonResponse(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
+// pathAllowed checks whether requestPath matches any of the allowed path
+// patterns. requestPath must be the URL path only (no query string) — this
+// is guaranteed when derived from r.URL.Path.
+// Patterns ending in "*" match any path sharing that prefix; otherwise exact match.
 func pathAllowed(requestPath string, allowedPaths []string) bool {
 	for _, pattern := range allowedPaths {
 		if strings.HasSuffix(pattern, "*") {

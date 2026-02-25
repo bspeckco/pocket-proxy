@@ -879,8 +879,9 @@ func TestProxyWildcardPath(t *testing.T) {
 func TestProxyLargeResponseNotStored(t *testing.T) {
 	env := setupTest(t)
 
-	// Generate a response larger than MaxResponseStoreSize (1MB)
-	largeBody := strings.Repeat("x", store.MaxResponseStoreSize+1)
+	// Generate a response larger than the default max response store size (1MB)
+	maxSize := env.store.MaxRespSize()
+	largeBody := strings.Repeat("x", maxSize+1)
 	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte(largeBody))
@@ -895,7 +896,7 @@ func TestProxyLargeResponseNotStored(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if len(body) != store.MaxResponseStoreSize+1 {
+	if len(body) != maxSize+1 {
 		t.Errorf("expected full body to be returned, got %d bytes", len(body))
 	}
 
@@ -1096,6 +1097,145 @@ func TestGetRunWithRequestLog(t *testing.T) {
 	}
 	if req1["counted"].(bool) != true {
 		t.Error("expected counted=true")
+	}
+}
+
+func TestProxyUpstreamConnectionFailure(t *testing.T) {
+	env := setupTest(t)
+
+	// Close upstream to simulate connection failure
+	env.upstream.Close()
+
+	runID, token := createRun(t, env, "test-svc")
+
+	resp := proxyReq(env, "GET", "/test", token)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", resp.StatusCode)
+	}
+	result := readJSON(resp)
+	if result["error"].(string) != "upstream_error" {
+		t.Errorf("expected 'upstream_error', got %q", result["error"])
+	}
+
+	// Budget should not have been consumed (reservation was released)
+	getResp := adminReq(env, "GET", "/admin/runs/"+runID, "")
+	getResult := readJSON(getResp)
+	if int(getResult["requests_used"].(float64)) != 0 {
+		t.Errorf("expected 0 requests_used after upstream failure, got %v", getResult["requests_used"])
+	}
+}
+
+func TestProxyDedupPreservesContentType(t *testing.T) {
+	env := setupTest(t)
+
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte("plain text response"))
+	}
+
+	_, token := createRun(t, env, "test-svc")
+
+	// First request
+	resp1 := proxyReq(env, "GET", "/test", token)
+	ct1 := resp1.Header.Get("Content-Type")
+	resp1.Body.Close()
+
+	// Second request (dedup)
+	resp2 := proxyReq(env, "GET", "/test", token)
+	ct2 := resp2.Header.Get("Content-Type")
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	if resp2.Header.Get("X-Dedup") != "true" {
+		t.Error("expected X-Dedup=true on second request")
+	}
+	if ct2 != ct1 {
+		t.Errorf("dedup Content-Type mismatch: original %q, dedup %q", ct1, ct2)
+	}
+	if string(body2) != "plain text response" {
+		t.Errorf("unexpected dedup body: %s", body2)
+	}
+}
+
+func TestProxyPostDedupIncludesBody(t *testing.T) {
+	env := setupTest(t)
+
+	callCount := 0
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(fmt.Sprintf(`{"call":%d}`, callCount)))
+	}
+
+	_, token := createRun(t, env, "test-svc")
+
+	// POST with body A
+	resp1 := proxyReqWithBody(env, "POST", "/test", token, `{"query":"A"}`)
+	resp1.Body.Close()
+
+	// POST with body B (different body, should NOT be deduped)
+	resp2 := proxyReqWithBody(env, "POST", "/test", token, `{"query":"B"}`)
+	resp2.Body.Close()
+
+	if callCount != 2 {
+		t.Errorf("expected 2 upstream calls (different POST bodies), got %d", callCount)
+	}
+
+	// POST with body A again (same body, should be deduped)
+	resp3 := proxyReqWithBody(env, "POST", "/test", token, `{"query":"A"}`)
+	resp3.Body.Close()
+
+	if callCount != 2 {
+		t.Errorf("expected 2 upstream calls (same POST body deduped), got %d", callCount)
+	}
+	if resp3.Header.Get("X-Dedup") != "true" {
+		t.Error("expected X-Dedup=true for repeated POST with same body")
+	}
+}
+
+func TestProxyExhaustedStatusViaAdmin(t *testing.T) {
+	env := setupTest(t)
+
+	runID, token := createRun(t, env, "test-svc") // max=5
+
+	// Exhaust budget
+	for i := 0; i < 5; i++ {
+		resp := proxyReq(env, "GET", fmt.Sprintf("/test?i=%d", i), token)
+		resp.Body.Close()
+	}
+
+	// Admin API should report exhausted status
+	resp := adminReq(env, "GET", "/admin/runs/"+runID, "")
+	result := readJSON(resp)
+	if result["status"].(string) != "exhausted" {
+		t.Errorf("expected exhausted status, got %q", result["status"])
+	}
+}
+
+func TestCloseRunFlushIncludesRunMetrics(t *testing.T) {
+	env := setupTest(t)
+
+	runID, token := createRun(t, env, "test-svc")
+
+	// Make a request
+	proxyReq(env, "GET", "/test", token).Body.Close()
+
+	// Flush
+	dir := t.TempDir()
+	flushPath := dir + "/out.json"
+	resp := adminReq(env, "POST", "/admin/runs/"+runID+"/close",
+		fmt.Sprintf(`{"mode":"flush","path":"%s"}`, flushPath))
+	resp.Body.Close()
+
+	data, _ := os.ReadFile(flushPath)
+	var flushed map[string]interface{}
+	json.Unmarshal(data, &flushed)
+
+	if _, ok := flushed["requests_used"]; !ok {
+		t.Error("flush data should include requests_used")
+	}
+	if _, ok := flushed["max_requests"]; !ok {
+		t.Error("flush data should include max_requests")
 	}
 }
 

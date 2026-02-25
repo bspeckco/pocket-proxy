@@ -15,8 +15,10 @@ type Config struct {
 }
 
 type AdminConfig struct {
-	Secret string `yaml:"secret"`
-	Port   int    `yaml:"port"`
+	Secret      string `yaml:"secret"`
+	Port        int    `yaml:"port"`
+	IDSize      int    `yaml:"id_size"`
+	MaxRespSize int    `yaml:"max_response_size"`
 }
 
 type CredentialConfig struct {
@@ -59,6 +61,13 @@ func validate(cfg *Config) (*Config, error) {
 	}
 	if cfg.Admin.Port < 1 || cfg.Admin.Port > 65535 {
 		return nil, fmt.Errorf("admin.port must be between 1 and 65535, got %d", cfg.Admin.Port)
+	}
+
+	if cfg.Admin.IDSize == 0 {
+		cfg.Admin.IDSize = 16
+	}
+	if cfg.Admin.MaxRespSize == 0 {
+		cfg.Admin.MaxRespSize = 1 << 20 // 1MB
 	}
 
 	if len(cfg.Services) == 0 {

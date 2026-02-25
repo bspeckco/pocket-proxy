@@ -27,15 +27,15 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	// Securely delete config file
+	// Securely delete config file (secureDelete already falls back to os.Remove)
 	if err := secureDelete(configPath); err != nil {
-		log.Printf("warning: secure delete failed, falling back to regular delete: %v", err)
-		if err := os.Remove(configPath); err != nil {
-			log.Printf("warning: failed to delete config file: %v", err)
-		}
+		log.Printf("warning: failed to delete config file: %v", err)
 	}
 
-	st, err := store.New()
+	st, err := store.New(store.StoreOptions{
+		IDSize:      cfg.Admin.IDSize,
+		MaxRespSize: cfg.Admin.MaxRespSize,
+	})
 	if err != nil {
 		log.Fatalf("failed to initialize store: %v", err)
 	}

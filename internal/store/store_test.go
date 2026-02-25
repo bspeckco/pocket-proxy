@@ -153,6 +153,35 @@ func TestReserveBudgetExhausted(t *testing.T) {
 	if err != ErrBudgetExhausted {
 		t.Errorf("expected ErrBudgetExhausted, got %v", err)
 	}
+
+	// Status should now be 'exhausted'
+	got, _ := s.GetRun(run.ID)
+	if got.Status != "exhausted" {
+		t.Errorf("expected status 'exhausted', got %q", got.Status)
+	}
+}
+
+func TestReserveExhaustedThenRelease(t *testing.T) {
+	s := newTestStore(t)
+
+	run, _ := s.CreateRun("svc", time.Now().Add(time.Hour))
+
+	// Exhaust budget
+	for i := 0; i < 3; i++ {
+		s.ReserveRequest(run.ID, 3)
+	}
+
+	// Release one (simulating non-2xx that exhausted the budget)
+	s.ReleaseRequest(run.ID)
+
+	// Status should revert to 'active'
+	got, _ := s.GetRun(run.ID)
+	if got.Status != "active" {
+		t.Errorf("expected status 'active' after release, got %q", got.Status)
+	}
+	if got.RequestsUsed != 2 {
+		t.Errorf("expected 2 requests_used after release, got %d", got.RequestsUsed)
+	}
 }
 
 func TestReserveExpiredRun(t *testing.T) {
@@ -164,6 +193,12 @@ func TestReserveExpiredRun(t *testing.T) {
 	_, err := s.ReserveRequest(run.ID, 5)
 	if err != ErrRunExpired {
 		t.Errorf("expected ErrRunExpired, got %v", err)
+	}
+
+	// Status should now be 'expired'
+	got, _ := s.GetRun(run.ID)
+	if got.Status != "expired" {
+		t.Errorf("expected status 'expired', got %q", got.Status)
 	}
 }
 
@@ -254,7 +289,8 @@ func TestLogRequestWithResponseBody(t *testing.T) {
 		StatusCode:   200,
 		Counted:      true,
 		ResponseBody: body,
-		DedupKey:     DedupKey("GET", "/test"),
+		ContentType:  "application/json",
+		DedupKey:     DedupKey("GET", "/test", nil),
 	}
 	if err := s.LogRequest(entry); err != nil {
 		t.Fatal(err)
@@ -269,6 +305,9 @@ func TestLogRequestWithResponseBody(t *testing.T) {
 	}
 	if string(responses[0].ResponseBody) != `{"data":"hello"}` {
 		t.Errorf("unexpected response body: %s", responses[0].ResponseBody)
+	}
+	if responses[0].ContentType != "application/json" {
+		t.Errorf("unexpected content type: %s", responses[0].ContentType)
 	}
 }
 
@@ -300,7 +339,7 @@ func TestFindDedupEntry(t *testing.T) {
 
 	run, _ := s.CreateRun("svc", time.Now().Add(time.Hour))
 
-	dk := DedupKey("GET", "/test?q=hello")
+	dk := DedupKey("GET", "/test?q=hello", nil)
 	entry := &RequestEntry{
 		RunID:        run.ID,
 		Method:       "GET",
@@ -308,6 +347,7 @@ func TestFindDedupEntry(t *testing.T) {
 		StatusCode:   200,
 		Counted:      true,
 		ResponseBody: []byte(`{"result":"data"}`),
+		ContentType:  "application/json",
 		DedupKey:     dk,
 	}
 	s.LogRequest(entry)
@@ -321,6 +361,9 @@ func TestFindDedupEntry(t *testing.T) {
 	}
 	if string(found.ResponseBody) != `{"result":"data"}` {
 		t.Errorf("unexpected response body: %s", found.ResponseBody)
+	}
+	if found.ContentType != "application/json" {
+		t.Errorf("unexpected content type: %s", found.ContentType)
 	}
 }
 
@@ -343,7 +386,7 @@ func TestFindDedupOnlyCountedEntries(t *testing.T) {
 
 	run, _ := s.CreateRun("svc", time.Now().Add(time.Hour))
 
-	dk := DedupKey("GET", "/test")
+	dk := DedupKey("GET", "/test", nil)
 	// Log uncounted entry (non-2xx response)
 	s.LogRequest(&RequestEntry{
 		RunID:      run.ID,
@@ -392,10 +435,10 @@ func TestDeleteRunData(t *testing.T) {
 }
 
 func TestDedupKey(t *testing.T) {
-	k1 := DedupKey("GET", "/test?q=hello")
-	k2 := DedupKey("GET", "/test?q=hello")
-	k3 := DedupKey("POST", "/test?q=hello")
-	k4 := DedupKey("GET", "/test?q=world")
+	k1 := DedupKey("GET", "/test?q=hello", nil)
+	k2 := DedupKey("GET", "/test?q=hello", nil)
+	k3 := DedupKey("POST", "/test?q=hello", nil)
+	k4 := DedupKey("GET", "/test?q=world", nil)
 
 	if k1 != k2 {
 		t.Error("same inputs should produce same key")
@@ -408,10 +451,42 @@ func TestDedupKey(t *testing.T) {
 	}
 }
 
+func TestDedupKeyWithBody(t *testing.T) {
+	k1 := DedupKey("POST", "/test", []byte(`{"a":1}`))
+	k2 := DedupKey("POST", "/test", []byte(`{"a":1}`))
+	k3 := DedupKey("POST", "/test", []byte(`{"a":2}`))
+	k4 := DedupKey("POST", "/test", nil)
+
+	if k1 != k2 {
+		t.Error("same body should produce same key")
+	}
+	if k1 == k3 {
+		t.Error("different bodies should produce different keys")
+	}
+	if k1 == k4 {
+		t.Error("body vs no-body should produce different keys")
+	}
+}
+
 func TestGenerateID(t *testing.T) {
 	id := GenerateID(16)
 	if len(id) != 16 {
 		t.Errorf("expected length 16, got %d", len(id))
+	}
+
+	// Check all characters are in the alphabet
+	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	for _, c := range id {
+		found := false
+		for _, a := range alphabet {
+			if c == a {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("character %q not in alphabet", c)
+		}
 	}
 
 	// Check uniqueness
@@ -422,6 +497,46 @@ func TestGenerateID(t *testing.T) {
 			t.Errorf("duplicate ID: %s", id)
 		}
 		ids[id] = true
+	}
+}
+
+func TestGenerateIDDistribution(t *testing.T) {
+	// Verify rejection sampling produces approximately uniform distribution
+	counts := make(map[byte]int)
+	for i := 0; i < 10000; i++ {
+		id := GenerateID(1)
+		counts[id[0]]++
+	}
+	// With 62 chars and 10000 samples, expected ~161 per char
+	// Allow wide range to avoid flaky tests but catch severe bias
+	for c, n := range counts {
+		if n < 80 || n > 280 {
+			t.Errorf("character %q appeared %d times (expected ~161)", c, n)
+		}
+	}
+}
+
+func TestStoreOptionsConfigurable(t *testing.T) {
+	s, err := New(StoreOptions{IDSize: 32, MaxRespSize: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if s.IDSize() != 32 {
+		t.Errorf("expected IDSize 32, got %d", s.IDSize())
+	}
+	if s.MaxRespSize() != 512 {
+		t.Errorf("expected MaxRespSize 512, got %d", s.MaxRespSize())
+	}
+
+	// Verify IDs are actually generated at the configured size
+	run, err := s.CreateRun("svc", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(run.ID) != 32 {
+		t.Errorf("expected run ID length 32, got %d", len(run.ID))
 	}
 }
 

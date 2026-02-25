@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,7 +18,7 @@ var proxyClient = &http.Client{
 	Timeout: 30 * time.Second,
 }
 
-// hop-by-hop headers that should not be forwarded
+// hop-by-hop headers that should not be forwarded (RFC 7230)
 var hopByHopHeaders = map[string]bool{
 	"Connection":          true,
 	"Keep-Alive":          true,
@@ -24,9 +26,13 @@ var hopByHopHeaders = map[string]bool{
 	"Proxy-Authenticate":  true,
 	"Proxy-Authorization": true,
 	"Te":                  true,
-	"Trailers":            true,
+	"Trailer":             true,
 	"Upgrade":             true,
 }
+
+// maxProxyReadSize is the maximum response body the proxy will read from upstream.
+// Responses exceeding this are truncated (the agent still gets up to this much).
+const maxProxyReadSize = 10 << 20 // 10MB
 
 func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	// 1. Extract and validate run token
@@ -54,6 +60,18 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Check run status
+	if run.Status == "exhausted" {
+		w.Header().Set("Content-Type", "application/json")
+		setBudgetHeaders(w, run.RequestsUsed, svc.MaxRequests)
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":         "budget_exhausted",
+			"message":       fmt.Sprintf("Run has reached its request limit (%d/%d).", svc.MaxRequests, svc.MaxRequests),
+			"requests_used": run.RequestsUsed,
+			"max_requests":  svc.MaxRequests,
+		})
+		return
+	}
 	if run.Status != "active" {
 		jsonError(w, http.StatusForbidden, "run_terminated", "This run has been revoked or has expired.")
 		return
@@ -74,35 +92,51 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Build dedup key and check for cached response
+	// 5. Build log path and dedup key
 	logPath := targetPath
 	if r.URL.RawQuery != "" {
 		logPath = targetPath + "?" + r.URL.RawQuery
 	}
-	dedupKey := store.DedupKey(r.Method, logPath)
 
+	// Read request body for dedup and forwarding
+	var reqBody []byte
+	if r.Body != nil {
+		reqBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, "bad_request", "Failed to read request body.")
+			return
+		}
+	}
+
+	dedupKey := store.DedupKey(r.Method, logPath, reqBody)
+
+	// 6. Check for cached dedup response
 	if svc.DedupEnabled && svc.StoreResponses {
 		entry, err := s.store.FindDedupEntry(run.ID, dedupKey)
 		if err == nil && entry != nil && entry.ResponseBody != nil {
 			setBudgetHeaders(w, run.RequestsUsed, svc.MaxRequests)
 			w.Header().Set("X-Dedup", "true")
-			w.Header().Set("Content-Type", "application/json")
+			ct := entry.ContentType
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
+			w.Header().Set("Content-Type", ct)
 			w.WriteHeader(entry.StatusCode)
 			w.Write(entry.ResponseBody)
 			return
 		}
 	}
 
-	// 6. Check budget - atomic reserve
+	// 7. Check budget - atomic reserve
 	if run.RequestsUsed >= svc.MaxRequests {
 		w.Header().Set("Content-Type", "application/json")
 		setBudgetHeaders(w, run.RequestsUsed, svc.MaxRequests)
 		w.WriteHeader(http.StatusTooManyRequests)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"error":          "budget_exhausted",
-			"message":        fmt.Sprintf("Run has reached its request limit (%d/%d).", svc.MaxRequests, svc.MaxRequests),
-			"requests_used":  run.RequestsUsed,
-			"max_requests":   svc.MaxRequests,
+			"error":         "budget_exhausted",
+			"message":       fmt.Sprintf("Run has reached its request limit (%d/%d).", svc.MaxRequests, svc.MaxRequests),
+			"requests_used": run.RequestsUsed,
+			"max_requests":  svc.MaxRequests,
 		})
 		return
 	}
@@ -115,10 +149,10 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 			setBudgetHeaders(w, svc.MaxRequests, svc.MaxRequests)
 			w.WriteHeader(http.StatusTooManyRequests)
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error":          "budget_exhausted",
-				"message":        fmt.Sprintf("Run has reached its request limit (%d/%d).", svc.MaxRequests, svc.MaxRequests),
-				"requests_used":  svc.MaxRequests,
-				"max_requests":   svc.MaxRequests,
+				"error":         "budget_exhausted",
+				"message":       fmt.Sprintf("Run has reached its request limit (%d/%d).", svc.MaxRequests, svc.MaxRequests),
+				"requests_used": svc.MaxRequests,
+				"max_requests":  svc.MaxRequests,
 			})
 		case store.ErrRunNotActive:
 			jsonError(w, http.StatusForbidden, "run_terminated", "This run has been revoked or has expired.")
@@ -130,16 +164,23 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 7. Build and send upstream request
+	// 8. Build and send upstream request
 	baseURL := strings.TrimRight(svc.BaseURL, "/")
 	targetURL := baseURL + targetPath
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
+	var bodyReader io.Reader
+	if len(reqBody) > 0 {
+		bodyReader = bytes.NewReader(reqBody)
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bodyReader)
 	if err != nil {
-		s.store.ReleaseRequest(run.ID)
+		if releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
+			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
+		}
 		jsonError(w, http.StatusInternalServerError, "internal_error", "Failed to create upstream request.")
 		return
 	}
@@ -160,48 +201,58 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := proxyClient.Do(upstreamReq)
 	if err != nil {
-		s.store.ReleaseRequest(run.ID)
+		if releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
+			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
+		}
 		jsonError(w, http.StatusBadGateway, "upstream_error", "Failed to reach upstream service.")
 		return
 	}
 	defer resp.Body.Close()
 
-	// 8. Read response body
-	body, err := io.ReadAll(resp.Body)
+	// 9. Read response body (bounded)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProxyReadSize))
 	if err != nil {
-		s.store.ReleaseRequest(run.ID)
+		if releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
+			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
+		}
 		jsonError(w, http.StatusBadGateway, "upstream_error", "Failed to read upstream response.")
 		return
 	}
 
-	// 9. Determine if this counts against budget
+	// 10. Determine if this counts against budget
 	is2xx := resp.StatusCode >= 200 && resp.StatusCode < 300
 	counted := is2xx
 
 	if !is2xx {
 		// Non-2xx: release the reservation
-		s.store.ReleaseRequest(run.ID)
+		if releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
+			log.Printf("error releasing request for run %s: %v", run.ID, releaseErr)
+		}
 		newCount = newCount - 1
 	}
 
-	// 10. Log the request
+	// 11. Log the request
+	contentType := resp.Header.Get("Content-Type")
 	logEntry := &store.RequestEntry{
-		RunID:      run.ID,
-		Method:     r.Method,
-		Path:       logPath,
-		StatusCode: resp.StatusCode,
-		Counted:    counted,
-		DedupKey:   dedupKey,
+		RunID:       run.ID,
+		Method:      r.Method,
+		Path:        logPath,
+		StatusCode:  resp.StatusCode,
+		Counted:     counted,
+		DedupKey:    dedupKey,
+		ContentType: contentType,
 	}
 
 	// Store response body if applicable
-	if counted && svc.StoreResponses && len(body) <= store.MaxResponseStoreSize {
+	if counted && svc.StoreResponses && len(body) <= s.store.MaxRespSize() {
 		logEntry.ResponseBody = body
 	}
 
-	s.store.LogRequest(logEntry)
+	if logErr := s.store.LogRequest(logEntry); logErr != nil {
+		log.Printf("error logging request for run %s: %v", run.ID, logErr)
+	}
 
-	// 11. Forward upstream response to agent
+	// 12. Forward upstream response to agent
 	for key, values := range resp.Header {
 		if hopByHopHeaders[key] || key == "Content-Length" {
 			continue

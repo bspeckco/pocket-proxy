@@ -13,20 +13,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const (
-	DefaultIDSize        = 16
-	MaxResponseStoreSize = 1 << 20 // 1MB
-)
-
 var (
-	ErrRunNotActive   = errors.New("run is not active")
-	ErrRunExpired     = errors.New("run has expired")
+	ErrRunNotActive    = errors.New("run is not active")
+	ErrRunExpired      = errors.New("run has expired")
 	ErrBudgetExhausted = errors.New("budget exhausted")
 )
 
 type Store struct {
-	db *sql.DB
-	mu sync.Mutex
+	db     *sql.DB
+	mu     sync.Mutex
+	idSize int
+	maxRespSize int
 }
 
 type Run struct {
@@ -40,18 +37,24 @@ type Run struct {
 }
 
 type RequestEntry struct {
-	ID           string
-	RunID        string
-	Method       string
-	Path         string
-	StatusCode   int
-	Counted      bool
-	ResponseBody []byte
-	DedupKey     string
-	CreatedAt    time.Time
+	ID              string
+	RunID           string
+	Method          string
+	Path            string
+	StatusCode      int
+	Counted         bool
+	ResponseBody    []byte
+	ContentType     string
+	DedupKey        string
+	CreatedAt       time.Time
 }
 
-func New() (*Store, error) {
+type StoreOptions struct {
+	IDSize      int
+	MaxRespSize int
+}
+
+func New(opts ...StoreOptions) (*Store, error) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite: %w", err)
@@ -80,6 +83,7 @@ func New() (*Store, error) {
 			status_code INTEGER NOT NULL,
 			counted INTEGER NOT NULL DEFAULT 0,
 			response_body BLOB,
+			content_type TEXT NOT NULL DEFAULT '',
 			dedup_key TEXT,
 			created_at INTEGER NOT NULL,
 			FOREIGN KEY (run_id) REFERENCES runs(id)
@@ -91,8 +95,21 @@ func New() (*Store, error) {
 		return nil, fmt.Errorf("creating tables: %w", err)
 	}
 
-	return &Store{db: db}, nil
+	s := &Store{db: db, idSize: 16, maxRespSize: 1 << 20}
+	if len(opts) > 0 {
+		if opts[0].IDSize > 0 {
+			s.idSize = opts[0].IDSize
+		}
+		if opts[0].MaxRespSize > 0 {
+			s.maxRespSize = opts[0].MaxRespSize
+		}
+	}
+
+	return s, nil
 }
+
+func (s *Store) IDSize() int      { return s.idSize }
+func (s *Store) MaxRespSize() int { return s.maxRespSize }
 
 func (s *Store) Close() error {
 	return s.db.Close()
@@ -102,8 +119,8 @@ func (s *Store) CreateRun(service string, expiresAt time.Time) (*Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	id := GenerateID(DefaultIDSize)
-	token := GenerateID(DefaultIDSize)
+	id := GenerateID(s.idSize)
+	token := GenerateID(s.idSize)
 	now := time.Now().UTC()
 
 	_, err := s.db.Exec(
@@ -199,13 +216,20 @@ func (s *Store) ReserveRequest(runID string, maxRequests int) (newCount int, err
 		if r == nil {
 			return 0, fmt.Errorf("run not found: %s", runID)
 		}
+		if r.Status == "exhausted" {
+			return r.RequestsUsed, ErrBudgetExhausted
+		}
 		if r.Status != "active" {
 			return r.RequestsUsed, ErrRunNotActive
 		}
 		if time.Now().UTC().After(r.ExpiresAt) {
+			// Persist expired status
+			s.db.Exec(`UPDATE runs SET status = 'expired' WHERE id = ? AND status = 'active'`, runID)
 			return r.RequestsUsed, ErrRunExpired
 		}
 		if r.RequestsUsed >= maxRequests {
+			// Persist exhausted status
+			s.db.Exec(`UPDATE runs SET status = 'exhausted' WHERE id = ? AND status = 'active'`, runID)
 			return r.RequestsUsed, ErrBudgetExhausted
 		}
 		return 0, fmt.Errorf("unexpected: could not reserve request for run %s", runID)
@@ -216,6 +240,12 @@ func (s *Store) ReserveRequest(runID string, maxRequests int) (newCount int, err
 	if err != nil {
 		return 0, fmt.Errorf("reading updated count: %w", err)
 	}
+
+	// If this reservation hit the max, persist exhausted status
+	if count >= maxRequests {
+		s.db.Exec(`UPDATE runs SET status = 'exhausted' WHERE id = ? AND status = 'active'`, runID)
+	}
+
 	return count, nil
 }
 
@@ -224,6 +254,9 @@ func (s *Store) ReserveRequest(runID string, maxRequests int) (newCount int, err
 func (s *Store) ReleaseRequest(runID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// If status was set to exhausted, revert to active since we're releasing
+	s.db.Exec(`UPDATE runs SET status = 'active' WHERE id = ? AND status = 'exhausted'`, runID)
 
 	_, err := s.db.Exec(
 		`UPDATE runs SET requests_used = requests_used - 1 WHERE id = ? AND requests_used > 0`,
@@ -252,17 +285,17 @@ func (s *Store) LogRequest(entry *RequestEntry) error {
 	defer s.mu.Unlock()
 
 	if entry.ID == "" {
-		entry.ID = GenerateID(DefaultIDSize)
+		entry.ID = GenerateID(s.idSize)
 	}
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now().UTC()
 	}
 
 	_, err := s.db.Exec(
-		`INSERT INTO request_log (id, run_id, method, path, status_code, counted, response_body, dedup_key, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO request_log (id, run_id, method, path, status_code, counted, response_body, content_type, dedup_key, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		entry.ID, entry.RunID, entry.Method, entry.Path, entry.StatusCode,
-		boolToInt(entry.Counted), entry.ResponseBody, entry.DedupKey, entry.CreatedAt.Unix(),
+		boolToInt(entry.Counted), entry.ResponseBody, entry.ContentType, entry.DedupKey, entry.CreatedAt.Unix(),
 	)
 	if err != nil {
 		return fmt.Errorf("logging request: %w", err)
@@ -275,7 +308,7 @@ func (s *Store) GetRequestLogs(runID string) ([]RequestEntry, error) {
 	defer s.mu.Unlock()
 
 	rows, err := s.db.Query(
-		`SELECT id, run_id, method, path, status_code, counted, response_body, dedup_key, created_at
+		`SELECT id, run_id, method, path, status_code, counted, response_body, content_type, dedup_key, created_at
 		 FROM request_log WHERE run_id = ? ORDER BY created_at ASC`, runID,
 	)
 	if err != nil {
@@ -289,7 +322,7 @@ func (s *Store) GetRequestLogs(runID string) ([]RequestEntry, error) {
 		var counted int
 		var createdAt int64
 		if err := rows.Scan(&e.ID, &e.RunID, &e.Method, &e.Path, &e.StatusCode,
-			&counted, &e.ResponseBody, &e.DedupKey, &createdAt); err != nil {
+			&counted, &e.ResponseBody, &e.ContentType, &e.DedupKey, &createdAt); err != nil {
 			return nil, fmt.Errorf("scanning request log: %w", err)
 		}
 		e.Counted = counted != 0
@@ -304,7 +337,7 @@ func (s *Store) GetResponses(runID string) ([]RequestEntry, error) {
 	defer s.mu.Unlock()
 
 	rows, err := s.db.Query(
-		`SELECT id, run_id, method, path, status_code, counted, response_body, dedup_key, created_at
+		`SELECT id, run_id, method, path, status_code, counted, response_body, content_type, dedup_key, created_at
 		 FROM request_log WHERE run_id = ? AND response_body IS NOT NULL ORDER BY created_at ASC`, runID,
 	)
 	if err != nil {
@@ -318,7 +351,7 @@ func (s *Store) GetResponses(runID string) ([]RequestEntry, error) {
 		var counted int
 		var createdAt int64
 		if err := rows.Scan(&e.ID, &e.RunID, &e.Method, &e.Path, &e.StatusCode,
-			&counted, &e.ResponseBody, &e.DedupKey, &createdAt); err != nil {
+			&counted, &e.ResponseBody, &e.ContentType, &e.DedupKey, &createdAt); err != nil {
 			return nil, fmt.Errorf("scanning response: %w", err)
 		}
 		e.Counted = counted != 0
@@ -336,11 +369,11 @@ func (s *Store) FindDedupEntry(runID, dedupKey string) (*RequestEntry, error) {
 	var counted int
 	var createdAt int64
 	err := s.db.QueryRow(
-		`SELECT id, run_id, method, path, status_code, counted, response_body, dedup_key, created_at
+		`SELECT id, run_id, method, path, status_code, counted, response_body, content_type, dedup_key, created_at
 		 FROM request_log WHERE run_id = ? AND dedup_key = ? AND counted = 1
 		 ORDER BY created_at DESC LIMIT 1`, runID, dedupKey,
 	).Scan(&e.ID, &e.RunID, &e.Method, &e.Path, &e.StatusCode,
-		&counted, &e.ResponseBody, &e.DedupKey, &createdAt)
+		&counted, &e.ResponseBody, &e.ContentType, &e.DedupKey, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -372,21 +405,45 @@ func (s *Store) DeleteRunData(runID string) error {
 	return tx.Commit()
 }
 
+// GenerateID creates a random alphanumeric string using rejection sampling
+// to avoid modulo bias.
 func GenerateID(size int) string {
 	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	b := make([]byte, size)
-	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	const alen = len(alphabet) // 62
+	// Largest multiple of 62 that fits in a byte: 62*4 = 248
+	const maxValid byte = byte((256 / alen) * alen) // 248
+
+	result := make([]byte, size)
+	buf := make([]byte, size+size/2) // extra to reduce retry loops
+	idx := 0
+	for idx < size {
+		if _, err := rand.Read(buf); err != nil {
+			panic(fmt.Sprintf("crypto/rand failed: %v", err))
+		}
+		for _, b := range buf {
+			if b < maxValid {
+				result[idx] = alphabet[b%byte(alen)]
+				idx++
+				if idx >= size {
+					break
+				}
+			}
+		}
 	}
-	for i := range b {
-		b[i] = alphabet[b[i]%byte(len(alphabet))]
-	}
-	return string(b)
+	return string(result)
 }
 
-func DedupKey(method, path string) string {
-	h := sha256.Sum256([]byte(method + "|" + path))
-	return hex.EncodeToString(h[:])
+// DedupKey computes a dedup hash from method, path, and optional request body.
+func DedupKey(method, path string, body []byte) string {
+	h := sha256.New()
+	h.Write([]byte(method))
+	h.Write([]byte("|"))
+	h.Write([]byte(path))
+	if len(body) > 0 {
+		h.Write([]byte("|"))
+		h.Write(body)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func boolToInt(b bool) int {
