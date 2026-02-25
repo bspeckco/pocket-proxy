@@ -44,6 +44,8 @@ A single YAML file defines everything the proxy needs: admin auth, credentials, 
 admin:
   secret: "adm_Tn4xKq9Rm2pLw8nJ"
   port: 9120
+  id_size: 16               # Nano ID length (default: 16)
+  max_response_size: 1048576 # Max cached response body in bytes (default: 1MB)
 
 credentials:
   x-api:
@@ -88,7 +90,7 @@ Each service defines a target API and the constraints for runs against it. All r
 
 ## Credential Handling
 
-In the current deployment model (ephemeral containers), the Crawl Space Go runner is the orchestrator and owns the entire lifecycle:
+In the current deployment model (ephemeral containers), the runner is the orchestrator and owns the entire lifecycle:
 
 1. Runner generates a random admin secret
 2. Runner writes the full config YAML to `/tmp` (admin secret, API credentials, service definitions)
@@ -114,7 +116,7 @@ The agent process only ever receives the run token and the proxy address. The ad
 | token | TEXT UNIQUE | Opaque token issued to agent (Nano ID) |
 | service | TEXT | Name of the service from config |
 | requests_used | INTEGER | Counter, starts at 0 |
-| status | TEXT | `active`, `exhausted`, `revoked`, `closed` |
+| status | TEXT | `active`, `exhausted`, `expired`, `revoked`, `closed` |
 | created_at | DATETIME | |
 | expires_at | DATETIME | Derived from service `expires_in_seconds` |
 
@@ -143,6 +145,8 @@ Only successful upstream responses (2xx status codes) count against the run budg
 This means the budget headers on a failed response show the same values as before the request was made. The agent knows the request failed, but hasn't lost budget.
 
 The rationale is simple: the agent got no usable data, so the request doesn't count. This keeps the rule predictable and avoids penalising agents for upstream instability or query iteration.
+
+Upstream timeouts and connection failures follow the same rule. If the proxy cannot reach the upstream service (timeout, DNS failure, connection refused), the request is not counted and the agent receives a `502 Bad Gateway` response with unchanged budget headers.
 
 ## APIs
 
@@ -216,6 +220,15 @@ Close a run.
 Modes:
 - `purge` (default) — delete all run data from memory immediately
 - `flush` — write request log and responses to a specified path, then purge
+
+Flush example:
+
+```json
+{
+  "mode": "flush",
+  "path": "/mnt/data/run-output.json"
+}
+```
 
 #### `DELETE /admin/runs/:id`
 
