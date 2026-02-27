@@ -39,13 +39,15 @@ type CredentialConfig struct {
 }
 
 type ServiceConfig struct {
-	BaseURL          string   `yaml:"base_url"`
-	Credential       string   `yaml:"credential"`
-	AllowedPaths     []string `yaml:"allowed_paths"`
-	MaxRequests      int      `yaml:"max_requests"`
-	DedupEnabled     bool     `yaml:"dedup_enabled"`
-	StoreResponses   bool     `yaml:"store_responses"`
-	ExpiresInSeconds int      `yaml:"expires_in_seconds"`
+	BaseURL           string   `yaml:"base_url"`
+	Credential        string   `yaml:"credential"`
+	AllowedPaths      []string `yaml:"allowed_paths"`
+	AllowedDomains    []string `yaml:"allowed_domains"`
+	MaxRequests       int      `yaml:"max_requests"`
+	ExpiresInSeconds  int      `yaml:"expires_in_seconds"`
+	DedupEnabled      bool     `yaml:"dedup_enabled"`
+	StoreResponses    bool     `yaml:"store_responses"`
+	AllowAbsoluteURLs bool     `yaml:"allow_absolute_urls"`
 }
 
 func Load(path string) (*Config, error) {
@@ -107,8 +109,20 @@ func validate(cfg *Config) (*Config, error) {
 	}
 
 	for name, svc := range cfg.Services {
-		if svc.BaseURL == "" {
-			return nil, fmt.Errorf("service %q: base_url is required", name)
+		if svc.AllowAbsoluteURLs {
+			if svc.BaseURL != "" && len(svc.AllowedPaths) == 0 {
+				return nil, fmt.Errorf("service %q: base_url is set but allowed_paths is empty (misconfiguration)", name)
+			}
+		} else {
+			if svc.BaseURL == "" {
+				return nil, fmt.Errorf("service %q: base_url is required", name)
+			}
+			if len(svc.AllowedPaths) == 0 {
+				return nil, fmt.Errorf("service %q: at least one allowed_path is required", name)
+			}
+			if len(svc.AllowedDomains) > 0 {
+				return nil, fmt.Errorf("service %q: allowed_domains has no effect without allow_absolute_urls", name)
+			}
 		}
 		if svc.Credential == "" {
 			return nil, fmt.Errorf("service %q: credential is required", name)
@@ -121,9 +135,6 @@ func validate(cfg *Config) (*Config, error) {
 		}
 		if svc.ExpiresInSeconds <= 0 {
 			return nil, fmt.Errorf("service %q: expires_in_seconds must be positive", name)
-		}
-		if len(svc.AllowedPaths) == 0 {
-			return nil, fmt.Errorf("service %q: at least one allowed_path is required", name)
 		}
 		if svc.DedupEnabled && !svc.StoreResponses {
 			return nil, fmt.Errorf("service %q: dedup_enabled requires store_responses to be enabled", name)
