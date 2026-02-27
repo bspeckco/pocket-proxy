@@ -27,6 +27,11 @@ func TestDomainAllowed(t *testing.T) {
 		{"api.github.com", []string{"API.GITHUB.COM"}, true},
 		{"sub.example.com:8080", []string{"*.example.com"}, true},
 		{"notgithub.com", []string{"*.github.com"}, false},
+		// IPv6 cases
+		{"[::1]", []string{"::1"}, true},
+		{"[::1]:8080", []string{"::1"}, true},
+		{"[2001:db8::1]", []string{"2001:db8::1"}, true},
+		{"[::1]", []string{"example.com"}, false},
 	}
 
 	for _, tt := range tests {
@@ -118,6 +123,30 @@ func TestResolveAbsoluteTarget(t *testing.T) {
 		{
 			name:        "no scheme",
 			targetURL:   "example.com/api",
+			wantCode:    http.StatusBadRequest,
+			wantErrType: "invalid_target_url",
+		},
+		{
+			name:        "URL with query string",
+			targetURL:   "https://api.example.com/search?q=hello&limit=10",
+			wantURL:     "https://api.example.com/search?q=hello&limit=10",
+			wantLogPath: "https://api.example.com/search?q=hello&limit=10",
+		},
+		{
+			name:        "URL with fragment",
+			targetURL:   "https://example.com/page#section",
+			wantURL:     "https://example.com/page#section",
+			wantLogPath: "https://example.com/page#section",
+		},
+		{
+			name:        "URL with userinfo rejected",
+			targetURL:   "https://user:pass@api.example.com/path",
+			wantCode:    http.StatusBadRequest,
+			wantErrType: "invalid_target_url",
+		},
+		{
+			name:        "URL with user only rejected",
+			targetURL:   "https://user@api.example.com/path",
 			wantCode:    http.StatusBadRequest,
 			wantErrType: "invalid_target_url",
 		},

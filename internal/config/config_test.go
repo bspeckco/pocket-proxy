@@ -581,6 +581,30 @@ services:
 	}
 }
 
+func TestAllowedDomainsWithoutAbsoluteURLs(t *testing.T) {
+	yaml := `
+admin:
+  secret: "s"
+  port: 9120
+credentials:
+  c:
+    header: "H"
+    value: "V"
+services:
+  s:
+    base_url: "http://x"
+    credential: "c"
+    allowed_paths: ["/"]
+    allowed_domains: ["api.example.com"]
+    max_requests: 1
+    expires_in_seconds: 60
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for allowed_domains without allow_absolute_urls")
+	}
+}
+
 func TestMultipleServicesAndCredentials(t *testing.T) {
 	yaml := `
 admin:

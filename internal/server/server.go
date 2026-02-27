@@ -25,6 +25,11 @@ func New(cfg *config.Config, st *store.Store, log *logger.Logger) *Server {
 		log:   log,
 		mux:   http.NewServeMux(),
 	}
+	for name, svc := range cfg.Services {
+		if svc.AllowAbsoluteURLs && len(svc.AllowedDomains) == 0 {
+			log.Warn("service %q: allow_absolute_urls is enabled with no allowed_domains — proxy will forward to any host", name)
+		}
+	}
 	s.routes()
 	return s
 }

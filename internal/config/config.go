@@ -39,15 +39,15 @@ type CredentialConfig struct {
 }
 
 type ServiceConfig struct {
-	BaseURL          string   `yaml:"base_url"`
-	Credential       string   `yaml:"credential"`
-	AllowedPaths     []string `yaml:"allowed_paths"`
-	MaxRequests      int      `yaml:"max_requests"`
-	DedupEnabled     bool     `yaml:"dedup_enabled"`
-	StoreResponses   bool     `yaml:"store_responses"`
-	ExpiresInSeconds int      `yaml:"expires_in_seconds"`
-	AllowAbsoluteURLs bool     `yaml:"allow_absolute_urls"`
+	BaseURL           string   `yaml:"base_url"`
+	Credential        string   `yaml:"credential"`
+	AllowedPaths      []string `yaml:"allowed_paths"`
 	AllowedDomains    []string `yaml:"allowed_domains"`
+	MaxRequests       int      `yaml:"max_requests"`
+	ExpiresInSeconds  int      `yaml:"expires_in_seconds"`
+	DedupEnabled      bool     `yaml:"dedup_enabled"`
+	StoreResponses    bool     `yaml:"store_responses"`
+	AllowAbsoluteURLs bool     `yaml:"allow_absolute_urls"`
 }
 
 func Load(path string) (*Config, error) {
@@ -119,6 +119,9 @@ func validate(cfg *Config) (*Config, error) {
 			}
 			if len(svc.AllowedPaths) == 0 {
 				return nil, fmt.Errorf("service %q: at least one allowed_path is required", name)
+			}
+			if len(svc.AllowedDomains) > 0 {
+				return nil, fmt.Errorf("service %q: allowed_domains has no effect without allow_absolute_urls", name)
 			}
 		}
 		if svc.Credential == "" {

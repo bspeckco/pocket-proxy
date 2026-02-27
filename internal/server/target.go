@@ -1,6 +1,7 @@
 package server
 
 import (
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,6 +36,11 @@ func resolveAbsoluteTarget(r *http.Request, svc *config.ServiceConfig) (*targetI
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, http.StatusBadRequest, "invalid_target_url",
 			"X-Target-URL must be a valid http/https URL."
+	}
+
+	if parsed.User != nil {
+		return nil, http.StatusBadRequest, "invalid_target_url",
+			"X-Target-URL must not contain userinfo (user:password@host)."
 	}
 
 	if !domainAllowed(parsed.Host, svc.AllowedDomains) {
@@ -81,9 +87,12 @@ func domainAllowed(host string, allowedDomains []string) bool {
 	if len(allowedDomains) == 0 {
 		return true
 	}
-	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		host = host[:idx]
+	// Strip port if present. net.SplitHostPort handles IPv6 brackets correctly.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
+	// Strip brackets from bare IPv6 addresses (e.g., "[::1]" without port).
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
 	host = strings.ToLower(host)
 	for _, pattern := range allowedDomains {
 		pattern = strings.ToLower(pattern)

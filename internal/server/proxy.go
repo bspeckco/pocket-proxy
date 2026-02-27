@@ -194,7 +194,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Forward request headers (except hop-by-hop and token)
+	// Forward request headers (except hop-by-hop and token).
+	// Keys from r.Header are in canonical MIME form (net/http.CanonicalHeaderKey),
+	// so "X-Target-URL" becomes "X-Target-Url" when iterating the map.
 	for key, values := range r.Header {
 		if hopByHopHeaders[key] || key == "X-Run-Token" || key == "X-Target-Url" {
 			s.log.Trace("skipping inbound header: %s", key)

@@ -98,6 +98,15 @@ func setupTest(t *testing.T) *testEnv {
 				StoreResponses:    false,
 				ExpiresInSeconds:  3600,
 			},
+			"hybrid-svc": {
+				AllowAbsoluteURLs: true,
+				Credential:        "test-cred",
+				AllowedPaths:      []string{"/allowed/*"},
+				MaxRequests:       10,
+				DedupEnabled:      false,
+				StoreResponses:    false,
+				ExpiresInSeconds:  3600,
+			},
 		},
 	}
 
@@ -1634,5 +1643,75 @@ func TestAbsoluteURLNon2xxDoesNotCount(t *testing.T) {
 	result := readJSON(adminResp)
 	if int(result["requests_used"].(float64)) != 1 {
 		t.Errorf("expected 1 requests_used, got %v", result["requests_used"])
+	}
+}
+
+func TestAbsoluteURLUserinfoRejected(t *testing.T) {
+	env := setupTest(t)
+
+	_, token := createRun(t, env, "absolute-url-svc")
+
+	resp := absoluteProxyReq(env, "GET", "https://user:pass@"+env.upstream.URL[len("http://"):]+"/test", token)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for URL with userinfo, got %d", resp.StatusCode)
+	}
+	result := readJSON(resp)
+	if result["error"].(string) != "invalid_target_url" {
+		t.Errorf("expected 'invalid_target_url' error, got %q", result["error"])
+	}
+}
+
+func TestAbsoluteURLHybridModePathRestriction(t *testing.T) {
+	env := setupTest(t)
+
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+
+	_, token := createRun(t, env, "hybrid-svc")
+
+	// Allowed path
+	resp := absoluteProxyReq(env, "GET", env.upstream.URL+"/allowed/resource", token)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("expected 200 for allowed path, got %d: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	// Blocked path
+	resp = absoluteProxyReq(env, "GET", env.upstream.URL+"/forbidden/resource", token)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 for blocked path in hybrid mode, got %d", resp.StatusCode)
+	}
+	result := readJSON(resp)
+	if result["error"].(string) != "path_not_allowed" {
+		t.Errorf("expected 'path_not_allowed' error, got %q", result["error"])
+	}
+}
+
+func TestAbsoluteURLQueryStringPreserved(t *testing.T) {
+	env := setupTest(t)
+
+	var receivedQuery string
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		receivedQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+
+	_, token := createRun(t, env, "absolute-url-svc")
+
+	resp := absoluteProxyReq(env, "GET", env.upstream.URL+"/search?q=hello&limit=10", token)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	if receivedQuery != "q=hello&limit=10" {
+		t.Errorf("expected query string 'q=hello&limit=10', got %q", receivedQuery)
 	}
 }
