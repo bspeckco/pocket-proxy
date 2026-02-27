@@ -435,6 +435,152 @@ services:
 	}
 }
 
+func TestAllowAbsoluteURLsValid(t *testing.T) {
+	yaml := `
+admin:
+  secret: "s"
+  port: 9120
+credentials:
+  c:
+    header: "H"
+    value: "V"
+services:
+  s:
+    allow_absolute_urls: true
+    credential: "c"
+    max_requests: 10
+    expires_in_seconds: 3600
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("expected valid config for allow_absolute_urls without base_url/paths, got: %v", err)
+	}
+	svc := cfg.Services["s"]
+	if !svc.AllowAbsoluteURLs {
+		t.Error("expected AllowAbsoluteURLs to be true")
+	}
+}
+
+func TestAllowAbsoluteURLsWithDomains(t *testing.T) {
+	yaml := `
+admin:
+  secret: "s"
+  port: 9120
+credentials:
+  c:
+    header: "H"
+    value: "V"
+services:
+  s:
+    allow_absolute_urls: true
+    credential: "c"
+    allowed_domains:
+      - "api.github.com"
+      - "*.example.com"
+    max_requests: 10
+    expires_in_seconds: 3600
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	svc := cfg.Services["s"]
+	if len(svc.AllowedDomains) != 2 {
+		t.Errorf("expected 2 allowed domains, got %d", len(svc.AllowedDomains))
+	}
+}
+
+func TestAllowAbsoluteURLsWithBaseURLNoPaths(t *testing.T) {
+	yaml := `
+admin:
+  secret: "s"
+  port: 9120
+credentials:
+  c:
+    header: "H"
+    value: "V"
+services:
+  s:
+    allow_absolute_urls: true
+    base_url: "https://api.example.com"
+    credential: "c"
+    max_requests: 10
+    expires_in_seconds: 3600
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error when allow_absolute_urls has base_url but no paths")
+	}
+}
+
+func TestAllowAbsoluteURLsWithBaseURLAndPaths(t *testing.T) {
+	yaml := `
+admin:
+  secret: "s"
+  port: 9120
+credentials:
+  c:
+    header: "H"
+    value: "V"
+services:
+  s:
+    allow_absolute_urls: true
+    base_url: "https://api.example.com"
+    credential: "c"
+    allowed_paths: ["/v1/*"]
+    max_requests: 10
+    expires_in_seconds: 3600
+`
+	_, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("expected valid config for allow_absolute_urls with base_url and paths, got: %v", err)
+	}
+}
+
+func TestStandardModeStillRequiresBaseURL(t *testing.T) {
+	yaml := `
+admin:
+  secret: "s"
+  port: 9120
+credentials:
+  c:
+    header: "H"
+    value: "V"
+services:
+  s:
+    credential: "c"
+    allowed_paths: ["/"]
+    max_requests: 1
+    expires_in_seconds: 60
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for missing base_url in standard mode")
+	}
+}
+
+func TestStandardModeStillRequiresPaths(t *testing.T) {
+	yaml := `
+admin:
+  secret: "s"
+  port: 9120
+credentials:
+  c:
+    header: "H"
+    value: "V"
+services:
+  s:
+    base_url: "http://x"
+    credential: "c"
+    max_requests: 1
+    expires_in_seconds: 60
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for missing allowed_paths in standard mode")
+	}
+}
+
 func TestMultipleServicesAndCredentials(t *testing.T) {
 	yaml := `
 admin:

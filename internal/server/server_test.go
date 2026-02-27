@@ -81,6 +81,23 @@ func setupTest(t *testing.T) *testEnv {
 				StoreResponses:   false,
 				ExpiresInSeconds: 1,
 			},
+			"absolute-url-svc": {
+				AllowAbsoluteURLs: true,
+				Credential:        "test-cred",
+				MaxRequests:       5,
+				DedupEnabled:      true,
+				StoreResponses:    true,
+				ExpiresInSeconds:  3600,
+			},
+			"domain-filtered-svc": {
+				AllowAbsoluteURLs: true,
+				Credential:        "test-cred",
+				AllowedDomains:    []string{"127.0.0.1", "allowed.example.com", "*.github.com"},
+				MaxRequests:       10,
+				DedupEnabled:      false,
+				StoreResponses:    false,
+				ExpiresInSeconds:  3600,
+			},
 		},
 	}
 
@@ -1321,5 +1338,301 @@ func TestCreateRunProxyURLConfigurable(t *testing.T) {
 	proxyURL2 := result2["proxy_url"].(string)
 	if proxyURL2 != "https://proxy.example.com" {
 		t.Errorf("expected custom proxy_url, got %q", proxyURL2)
+	}
+}
+
+// --- Absolute URL Mode Integration Tests ---
+
+// absoluteProxyReq makes a proxy request with X-Target-URL header for absolute URL mode.
+func absoluteProxyReq(env *testEnv, method, targetURL, token string) *http.Response {
+	req, _ := http.NewRequest(method, env.proxy.URL+"/proxy/", nil)
+	if token != "" {
+		req.Header.Set("X-Run-Token", token)
+	}
+	if targetURL != "" {
+		req.Header.Set("X-Target-URL", targetURL)
+	}
+	resp, _ := http.DefaultClient.Do(req)
+	return resp
+}
+
+func TestAbsoluteURLProxySuccess(t *testing.T) {
+	env := setupTest(t)
+
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"result":"absolute-ok"}`))
+	}
+
+	_, token := createRun(t, env, "absolute-url-svc")
+
+	resp := absoluteProxyReq(env, "GET", env.upstream.URL+"/some/path", token)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != `{"result":"absolute-ok"}` {
+		t.Errorf("unexpected body: %s", body)
+	}
+
+	// Check budget headers
+	if resp.Header.Get("X-Budget-Used") != "1" {
+		t.Errorf("expected X-Budget-Used=1, got %q", resp.Header.Get("X-Budget-Used"))
+	}
+	if resp.Header.Get("X-Budget-Total") != "5" {
+		t.Errorf("expected X-Budget-Total=5, got %q", resp.Header.Get("X-Budget-Total"))
+	}
+}
+
+func TestAbsoluteURLCredentialInjection(t *testing.T) {
+	env := setupTest(t)
+
+	var receivedAuth string
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}
+
+	_, token := createRun(t, env, "absolute-url-svc")
+	resp := absoluteProxyReq(env, "GET", env.upstream.URL+"/test", token)
+	resp.Body.Close()
+
+	if receivedAuth != "Bearer upstream-api-key" {
+		t.Errorf("expected credential injection, got Authorization: %q", receivedAuth)
+	}
+}
+
+func TestAbsoluteURLMissingHeader(t *testing.T) {
+	env := setupTest(t)
+
+	_, token := createRun(t, env, "absolute-url-svc")
+
+	// No X-Target-URL header
+	resp := absoluteProxyReq(env, "GET", "", token)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", resp.StatusCode)
+	}
+	result := readJSON(resp)
+	if result["error"].(string) != "missing_target_url" {
+		t.Errorf("expected 'missing_target_url' error, got %q", result["error"])
+	}
+}
+
+func TestAbsoluteURLDomainFiltering(t *testing.T) {
+	env := setupTest(t)
+
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+
+	_, token := createRun(t, env, "domain-filtered-svc")
+
+	// Allowed domain (127.0.0.1 is in the allow list, upstream runs there)
+	resp := absoluteProxyReq(env, "GET", env.upstream.URL+"/test", token)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("expected 200 for allowed domain, got %d: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	// Blocked domain
+	resp = absoluteProxyReq(env, "GET", "https://evil.com/test", token)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 for blocked domain, got %d", resp.StatusCode)
+	}
+	result := readJSON(resp)
+	if result["error"].(string) != "domain_not_allowed" {
+		t.Errorf("expected 'domain_not_allowed' error, got %q", result["error"])
+	}
+}
+
+func TestAbsoluteURLBudgetTracking(t *testing.T) {
+	env := setupTest(t)
+
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+
+	_, token := createRun(t, env, "absolute-url-svc") // max_requests=5
+
+	// Use all 5 requests (unique URLs to avoid dedup)
+	for i := 0; i < 5; i++ {
+		resp := absoluteProxyReq(env, "GET", fmt.Sprintf("%s/test?i=%d", env.upstream.URL, i), token)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i+1, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	// 6th should be rejected
+	resp := absoluteProxyReq(env, "GET", fmt.Sprintf("%s/test?i=6", env.upstream.URL), token)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("expected 429, got %d; body: %s", resp.StatusCode, body)
+	}
+	result := readJSON(resp)
+	if result["error"].(string) != "budget_exhausted" {
+		t.Errorf("expected 'budget_exhausted' error, got %q", result["error"])
+	}
+}
+
+func TestAbsoluteURLDedup(t *testing.T) {
+	env := setupTest(t)
+
+	callCount := 0
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(fmt.Sprintf(`{"call":%d}`, callCount)))
+	}
+
+	_, token := createRun(t, env, "absolute-url-svc") // dedup_enabled=true
+
+	targetURL := env.upstream.URL + "/test?q=hello"
+
+	// First request
+	resp1 := absoluteProxyReq(env, "GET", targetURL, token)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp1.StatusCode)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	if resp1.Header.Get("X-Budget-Used") != "1" {
+		t.Errorf("expected X-Budget-Used=1, got %q", resp1.Header.Get("X-Budget-Used"))
+	}
+	if resp1.Header.Get("X-Dedup") != "" {
+		t.Error("first request should not have X-Dedup header")
+	}
+
+	// Same request again - should be deduped
+	resp2 := absoluteProxyReq(env, "GET", targetURL, token)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp2.StatusCode)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	if resp2.Header.Get("X-Budget-Used") != "1" {
+		t.Errorf("dedup: expected X-Budget-Used=1 (unchanged), got %q", resp2.Header.Get("X-Budget-Used"))
+	}
+	if resp2.Header.Get("X-Dedup") != "true" {
+		t.Error("dedup: expected X-Dedup=true header")
+	}
+	if string(body2) != string(body1) {
+		t.Errorf("dedup: expected same body. got %s vs %s", body1, body2)
+	}
+
+	// Upstream should only have been called once
+	if callCount != 1 {
+		t.Errorf("expected 1 upstream call, got %d", callCount)
+	}
+}
+
+func TestAbsoluteURLHeadersNotForwarded(t *testing.T) {
+	env := setupTest(t)
+
+	var receivedTargetURL string
+	var receivedRunToken string
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		receivedTargetURL = r.Header.Get("X-Target-URL")
+		receivedRunToken = r.Header.Get("X-Run-Token")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}
+
+	_, token := createRun(t, env, "absolute-url-svc")
+	resp := absoluteProxyReq(env, "GET", env.upstream.URL+"/test", token)
+	resp.Body.Close()
+
+	if receivedTargetURL != "" {
+		t.Errorf("X-Target-URL should not be forwarded to upstream, got %q", receivedTargetURL)
+	}
+	if receivedRunToken != "" {
+		t.Errorf("X-Run-Token should not be forwarded to upstream, got %q", receivedRunToken)
+	}
+}
+
+func TestAbsoluteURLLogPath(t *testing.T) {
+	env := setupTest(t)
+
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+
+	runID, token := createRun(t, env, "absolute-url-svc")
+
+	targetURL := env.upstream.URL + "/some/path?q=test"
+	resp := absoluteProxyReq(env, "GET", targetURL, token)
+	resp.Body.Close()
+
+	// Check admin API shows full URL in request log
+	adminResp := adminReq(env, "GET", "/admin/runs/"+runID, "")
+	result := readJSON(adminResp)
+
+	requests := result["requests"].([]interface{})
+	if len(requests) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(requests))
+	}
+	req := requests[0].(map[string]interface{})
+	if req["path"].(string) != targetURL {
+		t.Errorf("expected log path %q, got %q", targetURL, req["path"])
+	}
+}
+
+func TestAbsoluteURLNon2xxDoesNotCount(t *testing.T) {
+	env := setupTest(t)
+
+	callCount := 0
+	env.upstreamHandler = func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount <= 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"upstream error"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok"}`))
+	}
+
+	runID, token := createRun(t, env, "absolute-url-svc")
+
+	// Make 2 failing requests
+	for i := 0; i < 2; i++ {
+		resp := absoluteProxyReq(env, "GET", env.upstream.URL+"/test", token)
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("request %d: expected 500, got %d", i+1, resp.StatusCode)
+		}
+		if resp.Header.Get("X-Budget-Used") != "0" {
+			t.Errorf("request %d: expected X-Budget-Used=0, got %q", i+1, resp.Header.Get("X-Budget-Used"))
+		}
+		resp.Body.Close()
+	}
+
+	// 3rd request succeeds
+	resp := absoluteProxyReq(env, "GET", env.upstream.URL+"/test", token)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Budget-Used") != "1" {
+		t.Errorf("expected X-Budget-Used=1 after first success, got %q", resp.Header.Get("X-Budget-Used"))
+	}
+	resp.Body.Close()
+
+	// Verify via admin API
+	adminResp := adminReq(env, "GET", "/admin/runs/"+runID, "")
+	result := readJSON(adminResp)
+	if int(result["requests_used"].(float64)) != 1 {
+		t.Errorf("expected 1 requests_used, got %v", result["requests_used"])
 	}
 }

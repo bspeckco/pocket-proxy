@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"pocket-proxy/internal/store"
@@ -87,22 +86,12 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Extract and validate target path
-	targetPath := strings.TrimPrefix(r.URL.Path, "/proxy")
-	if targetPath == "" {
-		targetPath = "/"
-	}
-
-	if !pathAllowed(targetPath, svc.AllowedPaths) {
-		s.log.Debug("proxy request rejected: path %q not allowed for run %s", targetPath, run.ID)
-		jsonError(w, http.StatusForbidden, "path_not_allowed", "This path is not permitted for the current run.")
+	// 4. Resolve target URL
+	target, errCode, errType, errMsg := resolveTarget(r, &svc)
+	if target == nil {
+		s.log.Debug("proxy request rejected: %s for run %s", errType, run.ID)
+		jsonError(w, errCode, errType, errMsg)
 		return
-	}
-
-	// 5. Build log path and dedup key
-	logPath := targetPath
-	if r.URL.RawQuery != "" {
-		logPath = targetPath + "?" + r.URL.RawQuery
 	}
 
 	// Read request body for dedup and forwarding (bounded to prevent memory exhaustion)
@@ -116,13 +105,13 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	dedupKey := store.DedupKey(r.Method, logPath, reqBody)
+	dedupKey := store.DedupKey(r.Method, target.LogPath, reqBody)
 
 	// 6. Check for cached dedup response
 	if svc.DedupEnabled && svc.StoreResponses {
 		entry, err := s.store.FindDedupEntry(run.ID, dedupKey)
 		if err == nil && entry != nil && entry.ResponseBody != nil {
-			s.log.Debug("dedup hit for run %s: %s %s", run.ID, r.Method, logPath)
+			s.log.Debug("dedup hit for run %s: %s %s", run.ID, r.Method, target.LogPath)
 			setBudgetHeaders(w, run.RequestsUsed, svc.MaxRequests)
 			w.Header().Set("X-Dedup", "true")
 			ct := entry.ContentType
@@ -179,14 +168,8 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 8. Build and send upstream request
-	baseURL := strings.TrimRight(svc.BaseURL, "/")
-	targetURL := baseURL + targetPath
-	if r.URL.RawQuery != "" {
-		targetURL += "?" + r.URL.RawQuery
-	}
-
-	s.log.Info("proxy %s %s -> %s (run=%s, budget=%d/%d)", r.Method, logPath, run.Service, run.ID, newCount, svc.MaxRequests)
-	s.log.Debug("upstream url: %s", targetURL)
+	s.log.Info("proxy %s %s -> %s (run=%s, budget=%d/%d)", r.Method, target.LogPath, run.Service, run.ID, newCount, svc.MaxRequests)
+	s.log.Debug("upstream url: %s", target.URL)
 
 	// Log inbound request headers
 	for key, values := range r.Header {
@@ -201,7 +184,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		s.log.Debug("request body: %d bytes", len(reqBody))
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bodyReader)
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, target.URL, bodyReader)
 	if err != nil {
 		s.log.Error("failed to create upstream request for run %s: %v", run.ID, err)
 		if _, releaseErr := s.store.ReleaseRequest(run.ID); releaseErr != nil {
@@ -213,7 +196,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Forward request headers (except hop-by-hop and token)
 	for key, values := range r.Header {
-		if hopByHopHeaders[key] || key == "X-Run-Token" {
+		if hopByHopHeaders[key] || key == "X-Run-Token" || key == "X-Target-Url" {
 			s.log.Trace("skipping inbound header: %s", key)
 			continue
 		}
@@ -282,7 +265,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	logEntry := &store.RequestEntry{
 		RunID:       run.ID,
 		Method:      r.Method,
-		Path:        logPath,
+		Path:        target.LogPath,
 		StatusCode:  resp.StatusCode,
 		Counted:     counted,
 		DedupKey:    dedupKey,
